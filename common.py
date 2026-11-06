@@ -22,6 +22,9 @@ import cv2
 import numpy as np
 import pandas as pd
 
+# ----------------------------------------------------------------------------- paths and constants
+
+
 def find_project_root():
     """The repository root is the first parent folder that contains .git."""
     cwd = Path.cwd()
@@ -49,6 +52,10 @@ def seed_everything(seed=SEED):
         torch.cuda.manual_seed_all(seed)
     except ImportError:
         pass
+
+
+# ----------------------------------------------------------------------------- annotations
+
 
 def load_split(split):
     """Read <split>/annotations_coco.json into three tables.
@@ -288,6 +295,10 @@ def write_submission(preds, test_df, path, max_dets=500):
     sub.to_csv(path, index=False)
     return sub
 
+
+# ----------------------------------------------------------------------------- visualisation
+
+
 def draw_boxes(ax, boxes, classes=None, color=None, scores=None, lw=0.8, ls="-"):
     """boxes: N x 4 [x1, y1, x2, y2]; colour by class unless `color` is given."""
     import matplotlib.patches as mpatches
@@ -298,3 +309,84 @@ def draw_boxes(ax, boxes, classes=None, color=None, scores=None, lw=0.8, ls="-")
         ax.add_patch(mpatches.Rectangle((b[0], b[1]), b[2] - b[0], b[3] - b[1], fill=False, ec=c, lw=lw, ls=ls))
         if scores is not None:
             ax.text(b[0], b[1] - 1, f"{scores[i]:.2f}", color=c, fontsize=5)
+
+
+# ----------------------------------------------------------------------------- error analysis
+
+
+def _iou(a, b):
+    """IoU matrix between N x 4 and M x 4 boxes [x1, y1, x2, y2]."""
+    lt = np.maximum(a[:, None, :2], b[None, :, :2])
+    rb = np.minimum(a[:, None, 2:], b[None, :, 2:])
+    inter = np.clip(rb - lt, 0, None).prod(-1)
+    area = lambda x: (x[:, 2] - x[:, 0]) * (x[:, 3] - x[:, 1])
+    return inter / (area(a)[:, None] + area(b)[None] - inter + 1e-9), inter / (area(a)[:, None] + 1e-9)
+
+
+def error_analysis(gt_path, preds, score_thr, iou_thr=0.5):
+    """Simplified TIDE-style breakdown of detections with score >= score_thr (IoU 0.5).
+
+    Every detection gets one type, checked in this order:
+      correct     same class, IoU >= 0.5 with a not yet matched GT box (greedy, by score)
+      ignored     >= 50 % of the box lies in an ignored region (not counted by the metric)
+      duplicate   IoU >= 0.5 with a GT of the same class that is already matched
+      wrong class IoU >= 0.5 with a GT of another class
+      localisation same class, 0.1 <= IoU < 0.5
+      background  everything else
+    Missed GT boxes are returned with their class and COCO size.
+    Returns (detection table, missed GT table).
+    """
+    gt = json.load(open(gt_path))
+    G, I = {}, {}
+    for a in gt["annotations"]:
+        x, y, w, h = a["bbox"]
+        (I if a["iscrowd"] else G).setdefault(a["image_id"], []).append([x, y, x + w, y + h, a["category_id"] - 1])
+    det_rows, miss_rows = [], []
+    for im in gt["images"]:
+        iid = im["id"]
+        g = np.array(G.get(iid, []), float).reshape(-1, 5)
+        ig = np.unique(np.array(I.get(iid, []), float).reshape(-1, 5)[:, :4], axis=0)
+        d = preds.get(iid, np.zeros((0, 6)))
+        d = d[d[:, 4] >= score_thr]
+        d = d[np.argsort(-d[:, 4])]
+        iou = _iou(d[:, :4], g[:, :4])[0] if len(g) else np.zeros((len(d), 0))
+        in_ign = (_iou(d[:, :4], ig)[1].max(1) >= 0.5) if len(ig) and len(d) else np.zeros(len(d), bool)
+        used = np.zeros(len(g), bool)
+        same = d[:, 5][:, None] == g[:, 4][None] if len(g) else np.zeros((len(d), 0), bool)
+        for k in range(len(d)):
+            s_iou = np.where(same[k], iou[k], 0)
+            free = np.where(~used, s_iou, 0)
+            if len(g) and free.max() >= iou_thr:
+                used[free.argmax()] = True; t = "correct"
+            elif in_ign[k]:
+                t = "ignored"
+            elif len(g) and s_iou.max() >= iou_thr:
+                t = "duplicate"
+            elif len(g) and np.where(~same[k], iou[k], 0).max() >= iou_thr:
+                t = "wrong class"
+            elif len(g) and s_iou.max() >= 0.1:
+                t = "localisation"
+            else:
+                t = "background"
+            det_rows.append((iid, int(d[k, 5]), d[k, 4], t))
+        for b in g[~used]:
+            area = (b[2] - b[0]) * (b[3] - b[1])
+            size = "small" if area < 32 ** 2 else "medium" if area < 96 ** 2 else "large"
+            miss_rows.append((iid, int(b[4]), size))
+    dets = pd.DataFrame(det_rows, columns=["image_id", "cls", "score", "type"])
+    missed = pd.DataFrame(miss_rows, columns=["image_id", "cls", "size"])
+    dets["cls_name"] = dets.cls.map(dict(enumerate(CLASSES)))
+    missed["cls_name"] = missed.cls.map(dict(enumerate(CLASSES)))
+    return dets, missed
+
+
+def best_f1_threshold(gt_path, preds, iou_thr=0.5):
+    """Score threshold that maximises F1 at IoU 0.5 (class-aware): used to pick an operating point
+    for error analysis and visualisations (mAP itself does not need a threshold)."""
+    dets, missed = error_analysis(gt_path, preds, 0.0, iou_thr)
+    n_gt = (dets.type == "correct").sum() + len(missed)
+    d = dets[dets.type != "ignored"].sort_values("score", ascending=False)
+    tp = (d.type == "correct").cumsum().values
+    f1 = 2 * tp / (np.arange(1, len(d) + 1) + n_gt)
+    k = f1.argmax()
+    return float(d.score.iloc[k]), float(f1[k])
