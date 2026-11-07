@@ -201,10 +201,11 @@ def make_coco_gt(frames, objs, igns, split, path):
 # pixels, cls is 0-based. Predictions for a set of images: dict image_id -> array.
 
 
-def coco_evaluate(gt_path, preds, max_dets=500):
+def coco_evaluate(gt_path, preds, max_dets=500, img_ids=None):
     """COCO metrics with up to `max_dets` detections per image (as on Kaggle).
 
     Returns mAP (= AP@[.5:.95]), AP50, AP75, AP_small/medium/large and per-class AP.
+    img_ids: evaluate only these images (e.g. one clip); default all images of the GT file.
     The metrics are read from the precision array directly, because COCOeval.summarize() hard-codes
     100 detections per image for the main AP.
     """
@@ -213,13 +214,14 @@ def coco_evaluate(gt_path, preds, max_dets=500):
 
     with contextlib.redirect_stdout(io.StringIO()):
         gt = COCO(str(gt_path))
+        keep = set(gt.getImgIds() if img_ids is None else img_ids)
         rows = [[iid, d[0], d[1], d[2] - d[0], d[3] - d[1], d[4], int(d[5]) + 1]
-                for iid, dets in preds.items() for d in dets[np.argsort(-dets[:, 4])][:max_dets]]
+                for iid, dets in preds.items() if iid in keep for d in dets[np.argsort(-dets[:, 4])][:max_dets]]
         if not rows:
             return {"mAP": 0.0}
         dt = gt.loadRes(np.array(rows, dtype=np.float64))
         E = COCOeval(gt, dt, "bbox")
-        E.params.imgIds = sorted(gt.getImgIds())
+        E.params.imgIds = sorted(keep)
         E.params.maxDets = [1, 100, max_dets]
         E.evaluate(); E.accumulate()
     P = E.eval["precision"]  # [IoU thr, recall, class, area, maxDets]
