@@ -150,7 +150,7 @@ def set_roi_box_loss(name):
 
 
 @torch.no_grad()
-def predict(model, items, device="cuda", batch_size=4, long_side=LONG_SIDE):
+def predict(model, items, device="cuda", batch_size=2, long_side=LONG_SIDE):
     """items: list of (key, path to the ORIGINAL image). Returns dict key -> N x 6 [x1, y1, x2, y2, score, cls]
     in original pixels (cls 0-based)."""
     model.eval()
@@ -184,11 +184,13 @@ def test_items(test_df):
 
 def train_detector(model, name, train_ds, val_gt, epochs=12, batch_size=4, lr=0.01, momentum=0.9,
                    weight_decay=1e-4, milestones=(8, 11), warmup_iters=300, device="cuda", eval_every=1,
-                   resume=False):
+                   resume=True):
     """SGD + linear warmup + step decay (x0.1 at `milestones`), mixed precision.
 
     After every `eval_every` epochs the model is evaluated on the validation frames with the COCO evaluator.
     Checkpoints: checkpoints/<name>_last.pt (for resuming) and checkpoints/<name>_best.pt (best val mAP).
+    With resume=True (default) an interrupted run continues from its last epoch, and a finished run is
+    not retrained: the best checkpoint is loaded instead.
     Returns the history table (loss and val metrics per epoch).
     """
     CHECKPOINTS.mkdir(exist_ok=True)
@@ -211,6 +213,11 @@ def train_detector(model, name, train_ds, val_gt, epochs=12, batch_size=4, lr=0.
         model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"]); scaler.load_state_dict(ck["scaler"])
         history, start, best = ck["history"], ck["epoch"] + 1, ck["best"]
         print(f"resumed from epoch {start}")
+
+    if start >= epochs:          # run already finished: keep notebooks re-runnable without retraining
+        print(f"{name}: already trained for {epochs} epochs, loading the best checkpoint")
+        model.load_state_dict(torch.load(CHECKPOINTS / f"{name}_best.pt", map_location=device))
+        return pd.DataFrame(history)
 
     vitems = val_items(val_gt)
     for ep in range(start, epochs):
@@ -237,6 +244,9 @@ def train_detector(model, name, train_ds, val_gt, epochs=12, batch_size=4, lr=0.
         row = {"epoch": ep + 1, "lr": lr_at(it), "train_min": round((time.time() - t0) / 60, 1),
                **{kk: round(v / iters, 4) for kk, v in run.items()}}
         if (ep + 1) % eval_every == 0 or ep + 1 == epochs:
+            del imgs, targets, losses, loss
+            if device == "cuda":
+                torch.cuda.empty_cache()     # release training buffers before validation to avoid OOM spikes
             m = coco_evaluate(val_gt, predict(model, vitems, device))
             row.update({kk: round(m[kk], 4) for kk in ["mAP", "AP50", "AP_small"]})
             if m["mAP"] > best:
@@ -332,3 +342,70 @@ def rpn_recall(model, gt_path, device="cuda", top_ns=(100, 300, 1000, 2000), iou
     out = df.pivot_table(index="top_n", columns="size", values="recalled", aggfunc="mean")
     out["all"] = df.groupby("top_n").recalled.mean()
     return out.reindex(columns=["small", "medium", "large", "all"]).round(3)
+
+
+# ----------------------------------------------------------------------------- RetinaNet
+
+
+def build_retinanet(anchor_base=(32, 64, 128, 256, 512), pretrained=True, **kwargs):
+    """RetinaNet ResNet50-FPN v2 (COCO weights) with a new 9-way classification head.
+
+    anchor_base: base anchor size per pyramid level P3..P7. As in torchvision, every level gets 3 scales
+    (x, x*2^(1/3), x*2^(2/3)) and 3 ratios (0.5, 1, 2) = 9 anchors per location, so the pretrained
+    regression head keeps its shape. The v2 model uses GIoU box loss and GroupNorm in the heads.
+    kwargs go to torchvision RetinaNet, e.g. fg_iou_thresh, bg_iou_thresh.
+    """
+    from torchvision.models.detection import RetinaNet_ResNet50_FPN_V2_Weights, retinanet_resnet50_fpn_v2
+    from torchvision.models.detection.retinanet import RetinaNetClassificationHead
+    kw = dict(detections_per_img=500, score_thresh=0.001, topk_candidates=1000, **_common_transform_kwargs())
+    kw.update(kwargs)
+    model = retinanet_resnet50_fpn_v2(weights=RetinaNet_ResNet50_FPN_V2_Weights.COCO_V1 if pretrained else None,
+                                      weights_backbone=None, **kw)
+    sizes = tuple((x, int(x * 2 ** (1.0 / 3)), int(x * 2 ** (2.0 / 3))) for x in anchor_base)
+    model.anchor_generator = AnchorGenerator(sizes, ((0.5, 1.0, 2.0),) * len(sizes))
+    n_anchors = model.anchor_generator.num_anchors_per_location()[0]
+    model.head.classification_head = RetinaNetClassificationHead(
+        model.backbone.out_channels, n_anchors, NUM_CLASSES, norm_layer=partial(torch.nn.GroupNorm, 32))
+    return model
+
+
+def set_focal_loss(alpha=0.25, gamma=2.0):
+    """Change the focal loss parameters used by torchvision RetinaNet (defaults: alpha 0.25, gamma 2)."""
+    from torchvision.models.detection import retinanet as tv_retinanet
+    from torchvision.ops import sigmoid_focal_loss
+    tv_retinanet.sigmoid_focal_loss = partial(sigmoid_focal_loss, alpha=alpha, gamma=gamma)
+
+
+@torch.no_grad()
+def anchor_coverage(model, ds, n_images=100, device="cuda"):
+    """How well an anchor configuration fits the data (no training needed).
+
+    For n training images: number of anchors per image, number of positive anchors (IoU >= fg threshold
+    of the model) per image, the negative : positive ratio, and per object size the share of GT boxes whose
+    best anchor reaches IoU >= 0.5 (otherwise the object gets a positive only through the low-quality match).
+    """
+    from torchvision.ops import box_iou
+    model.eval().to(device)
+    fg = model.proposal_matcher.high_threshold
+    rows, per_img = [], []
+    idx = np.linspace(0, len(ds) - 1, n_images).astype(int)
+    for i in idx:
+        img, t = ds[i]
+        images, targets = model.transform([img.to(device)], [{k: v.to(device) for k, v in t.items()}])
+        feats = list(model.backbone(images.tensors).values())
+        anchors = model.anchor_generator(images, feats)[0]
+        g = targets[0]["boxes"]
+        if not len(g):
+            continue
+        iou = box_iou(g, anchors)
+        n_pos = int((iou.max(0).values >= fg).sum())
+        per_img.append({"anchors": len(anchors), "positive anchors": n_pos})
+        area = ((g[:, 2] - g[:, 0]) * (g[:, 3] - g[:, 1])).cpu().numpy()
+        best = iou.max(1).values.cpu().numpy()
+        size = np.where(area < 32 ** 2, "small", np.where(area < 96 ** 2, "medium", "large"))
+        rows += [{"size": s, "best anchor IoU >= 0.5": b >= 0.5, "best anchor IoU": b} for s, b in zip(size, best)]
+    pi, gt = pd.DataFrame(per_img), pd.DataFrame(rows)
+    summary = {"anchors / image": int(pi["anchors"].mean()), "positive anchors / image": round(float(pi["positive anchors"].mean()), 1),
+               "neg : pos ratio": int((pi["anchors"] - pi["positive anchors"]).sum() / max(pi["positive anchors"].sum(), 1))}
+    by_size = gt.groupby("size")[["best anchor IoU >= 0.5", "best anchor IoU"]].mean().reindex(["small", "medium", "large"])
+    return summary, by_size.round(3)
