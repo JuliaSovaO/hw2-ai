@@ -392,3 +392,77 @@ def best_f1_threshold(gt_path, preds, iou_thr=0.5):
     f1 = 2 * tp / (np.arange(1, len(d) + 1) + n_gt)
     k = f1.argmax()
     return float(d.score.iloc[k]), float(f1[k])
+
+
+# ----------------------------------------------------------------------------- ensembling
+
+
+def wbf_merge(preds_list, sizes, weights=None, iou_thr=0.6, skip_box_thr=0.001, conf_type="avg"):
+    """Weighted Boxes Fusion (Solovyev et al. 2019, `ensemble-boxes` package) of several prediction dicts.
+
+    preds_list: list of dicts image_id -> N x 6 [x1, y1, x2, y2, score, cls] (different models or TTA passes)
+    sizes:      dict image_id -> (width, height), WBF works with coordinates normalised to [0, 1]
+    Boxes of the same class that overlap with IoU > iou_thr are averaged (weighted by score) instead of
+    suppressed; with conf_type="avg" a box found by only some of the models gets a proportionally lower score.
+    """
+    from ensemble_boxes import weighted_boxes_fusion
+    out = {}
+    for iid, (w, h) in sizes.items():
+        boxes, scores, labels = [], [], []
+        for p in preds_list:
+            d = p.get(iid, np.zeros((0, 6)))
+            boxes.append(np.clip(d[:, :4] / [w, h, w, h], 0, 1).tolist())
+            scores.append(d[:, 4].tolist()); labels.append(d[:, 5].tolist())
+        b, s, l = weighted_boxes_fusion(boxes, scores, labels, weights=weights, iou_thr=iou_thr,
+                                        skip_box_thr=skip_box_thr, conf_type=conf_type)
+        out[iid] = np.c_[np.asarray(b).reshape(-1, 4) * [w, h, w, h], s, l].astype(np.float64)
+    return out
+
+
+def image_sizes(gt_path):
+    return {im["id"]: (im["width"], im["height"]) for im in json.load(open(gt_path))["images"]}
+
+
+# ----------------------------------------------------------------------------- temporal smoothing (bonus)
+
+
+def temporal_rescore(preds, frame_of, window=2, alpha=0.6, iou_thr=0.5):
+    """Rescore detections using neighbouring video frames (a simple form of Seq-NMS / tubelet rescoring).
+
+    preds:    dict key -> N x 6 [x1, y1, x2, y2, score, cls]
+    frame_of: dict key -> (clip, frame number); frames of one clip must be consecutive
+    For each detection and each neighbour frame t+-1..t+-window, take the score of the best matching
+    detection there (same class, IoU >= iou_thr; 0 if none). New score = alpha * own score +
+    (1 - alpha) * mean of these neighbour scores. A real object is usually detected in neighbouring frames
+    too and keeps a high score; a flickering false positive loses score. Boxes are not changed.
+    Between consecutive frames objects move little (01_data, section 1.4: IoU 0.90 at k = 1), so plain IoU
+    matching works without motion compensation.
+    """
+    by_clip = {}
+    for k, (clip, f) in frame_of.items():
+        by_clip.setdefault(clip, {})[f] = k
+    out = {}
+    for clip, frames in by_clip.items():
+        for f, k in frames.items():
+            d = preds.get(k, np.zeros((0, 6)))
+            if not len(d):
+                out[k] = d
+                continue
+            nb_scores = []
+            for off in [o for o in range(-window, window + 1) if o]:
+                kn = frames.get(f + off)
+                if kn is None:
+                    continue
+                dn = preds.get(kn, np.zeros((0, 6)))
+                if not len(dn):
+                    nb_scores.append(np.zeros(len(d)))
+                    continue
+                iou = _iou(d[:, :4], dn[:, :4])[0]
+                iou[d[:, 5][:, None] != dn[:, 5][None]] = 0
+                s = np.where(iou >= iou_thr, dn[:, 4][None], 0).max(1)
+                nb_scores.append(s)
+            new = d.copy()
+            if nb_scores:
+                new[:, 4] = alpha * d[:, 4] + (1 - alpha) * np.mean(nb_scores, axis=0)
+            out[k] = new
+    return out

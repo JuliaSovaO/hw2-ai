@@ -97,3 +97,20 @@ def evaluate_ultra(name, weights, val_gt, config, kind="yolo", imgsz=1280, **pre
                        train_hours=round(float(h["time"].iloc[-1]) / 3600, 2) if "time" in h else None,
                        imgsz=imgsz, **config)
     return res, preds
+
+
+def predict_ultra_hflip(model, items, imgsz=1280, conf=0.001, max_det=500, batch=4):
+    """Predictions on horizontally flipped images, mapped back to the original coordinates (flip TTA).
+    Combined with the normal predictions via common.wbf_merge."""
+    import cv2
+    out = {}
+    for i in range(0, len(items), batch):
+        chunk = items[i:i + batch]
+        imgs = [cv2.imread(str(p))[:, ::-1].copy() for _, p in chunk]
+        res = model.predict(imgs, imgsz=imgsz, conf=conf, max_det=max_det, verbose=False)
+        for (key, _), r, im in zip(chunk, res, imgs):
+            w = im.shape[1]
+            b = r.boxes.xyxy.cpu().numpy().copy()
+            b[:, [0, 2]] = w - b[:, [2, 0]]
+            out[key] = np.c_[b, r.boxes.conf.cpu().numpy(), r.boxes.cls.cpu().numpy()].astype(np.float64)
+    return out
