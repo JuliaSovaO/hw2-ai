@@ -114,3 +114,44 @@ def predict_ultra_hflip(model, items, imgsz=1280, conf=0.001, max_det=500, batch
             b[:, [0, 2]] = w - b[:, [2, 0]]
             out[key] = np.c_[b, r.boxes.conf.cpu().numpy(), r.boxes.cls.cpu().numpy()].astype(np.float64)
     return out
+
+
+def predict_ultra_tiles(model, items, imgsz=1280, grid=(2, 2), overlap=0.2, conf=0.001, max_det=500,
+                        edge_px=3, batch=4):
+    """Sliced inference (idea of SAHI, Akyon et al. 2022): the frame is cut into grid[0] x grid[1] overlapping
+    tiles, every tile is resized to `imgsz` by the model (so small objects become 1.5-3x larger), and the boxes are
+    mapped back to the frame. Boxes that touch an inner tile border are dropped: they are usually cut objects,
+    which the neighbouring tile (thanks to the overlap) or the full-frame pass sees whole.
+    Returns dict key -> N x 6 [x1, y1, x2, y2, score, cls] in original pixels (tiles only; merge with the
+    full-frame predictions afterwards)."""
+    import cv2
+    nx, ny = grid
+    out = {}
+    for key, p in items:
+        img = cv2.imread(str(p))
+        H, W = img.shape[:2]
+        tw, th = int(np.ceil(W / (nx - (nx - 1) * overlap))), int(np.ceil(H / (ny - (ny - 1) * overlap)))
+        xs = [round(i * (W - tw) / max(nx - 1, 1)) for i in range(nx)]
+        ys = [round(j * (H - th) / max(ny - 1, 1)) for j in range(ny)]
+        tiles = [(x, y) for y in ys for x in xs]
+        crops = [img[y:y + th, x:x + tw] for x, y in tiles]
+        dets = []
+        for i in range(0, len(crops), batch):
+            res = model.predict(crops[i:i + batch], imgsz=imgsz, conf=conf, max_det=max_det, verbose=False)
+            for (x, y), r in zip(tiles[i:i + batch], res):
+                b = r.boxes.xyxy.cpu().numpy()
+                d = np.c_[b, r.boxes.conf.cpu().numpy(), r.boxes.cls.cpu().numpy()]
+                # drop boxes touching a tile border that lies inside the frame
+                inner = np.zeros(len(d), bool)
+                if x > 0:          inner |= d[:, 0] <= edge_px
+                if y > 0:          inner |= d[:, 1] <= edge_px
+                if x + tw < W:     inner |= d[:, 2] >= tw - edge_px
+                if y + th < H:     inner |= d[:, 3] >= th - edge_px
+                d = d[~inner]
+                d[:, [0, 2]] += x
+                d[:, [1, 3]] += y
+                d[:, [0, 2]] = d[:, [0, 2]].clip(0, W)
+                d[:, [1, 3]] = d[:, [1, 3]].clip(0, H)
+                dets.append(d)
+        out[key] = np.concatenate(dets).astype(np.float64) if dets else np.zeros((0, 6))
+    return out

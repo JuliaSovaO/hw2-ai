@@ -1,0 +1,19 @@
+{
+  "name": "final_inference_recipe_val",
+  "mAP": 0.3206,
+  "AP50": 0.5826,
+  "AP75": 0.3083,
+  "AP_small": 0.1444,
+  "AP_medium": 0.2911,
+  "AP_large": 0.4946,
+  "AP_person": 0.2971,
+  "AP_bicycle": 0.3139,
+  "AP_car": 0.5544,
+  "AP_van": 0.2925,
+  "AP_truck": 0.3763,
+  "AP_tricycle": 0.2955,
+  "AP_bus": 0.2819,
+  "AP_motor": 0.1528,
+  "recipe": "{'flip': True, 'yolo': True, 'w_rt': 1, 'iou': 0.65}",
+  "models": "rtdetr_base + yolo_1536 (trained on train clips)"
+}

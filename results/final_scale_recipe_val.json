@@ -1,0 +1,19 @@
+{
+  "name": "final_scale_recipe_val",
+  "mAP": 0.306,
+  "AP50": 0.5575,
+  "AP75": 0.2946,
+  "AP_small": 0.1649,
+  "AP_medium": 0.2821,
+  "AP_large": 0.4531,
+  "AP_person": 0.3108,
+  "AP_bicycle": 0.2649,
+  "AP_car": 0.5431,
+  "AP_van": 0.308,
+  "AP_truck": 0.3386,
+  "AP_tricycle": 0.2921,
+  "AP_bus": 0.2731,
+  "AP_motor": 0.1176,
+  "recipe": "full 1280 + tiles, NMS",
+  "models": "rtdetr_base (train clips only)"
+}

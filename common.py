@@ -466,3 +466,20 @@ def temporal_rescore(preds, frame_of, window=2, alpha=0.6, iou_thr=0.5):
                 new[:, 4] = alpha * d[:, 4] + (1 - alpha) * np.mean(nb_scores, axis=0)
             out[k] = new
     return out
+
+
+def nms_merge(preds_list, iou_thr=0.6, max_dets=500):
+    """Concatenate several prediction dicts and run class-wise NMS (alternative to WBF for merging
+    full-frame and tiled predictions: keeps the best-scoring box instead of averaging)."""
+    import torch
+    from torchvision.ops import batched_nms
+    out = {}
+    for iid in set().union(*[p.keys() for p in preds_list]):
+        d = np.concatenate([p.get(iid, np.zeros((0, 6))) for p in preds_list])
+        if not len(d):
+            out[iid] = d
+            continue
+        t = torch.from_numpy(d)
+        keep = batched_nms(t[:, :4], t[:, 4], t[:, 5].long(), iou_thr).numpy()[:max_dets]
+        out[iid] = d[keep]
+    return out

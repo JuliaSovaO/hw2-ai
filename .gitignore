@@ -3,3 +3,9 @@ checkpoints/
 runs/
 submissions/
 __pycache__/__pycache__/
+*.pt
+data/
+runs/
+checkpoints/
+submissions/
+__pycache__/
