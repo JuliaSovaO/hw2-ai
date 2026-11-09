@@ -1,0 +1,15 @@
+# Python 3.12. Versions used for the submitted results.
+# On Windows install torch first from https://download.pytorch.org/whl/cu128 to get a CUDA build.
+torch==2.14.1
+torchvision
+ultralytics==8.4.204
+pycocotools
+opencv-python
+ensemble-boxes
+numpy
+pandas
+matplotlib
+seaborn
+scikit-learn
+kaggle
+ipykernel
